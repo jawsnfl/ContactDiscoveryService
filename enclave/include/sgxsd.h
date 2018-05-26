@@ -98,8 +98,6 @@ typedef struct sgxsd_node_init_args {
   uint8_t pending_requests_table_order;
 } sgxsd_node_init_args_t;
 
-typedef struct sgxsd_ra_get_quote_args sgxsd_ra_get_quote_args_t;
-
 typedef uint64_t sgxsd_server_state_handle_t;
 
 //

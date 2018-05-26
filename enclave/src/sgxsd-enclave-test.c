@@ -24,18 +24,21 @@
 #include <setjmp.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #include "sgx_trts.h"
 #include "sgx_tcrypto.h"
 #include "sgx_spinlock.h"
+#include "sgx_quote.h"
 
+#include "bearssl.h"
 #include "sgxsd-enclave.h"
 #include "sgxsd.h"
 
 #include "cmockery.h"
 
 sgx_status_t sgxsd_enclave_node_init(const sgxsd_node_init_args_t* p_args);
-sgx_status_t sgxsd_enclave_get_next_quote(sgx_target_info_t qe_target_info, const sgxsd_ra_get_quote_args_t *p_get_quote_args, sgx_quote_t *p_quote, uint32_t quote_size);
+sgx_status_t sgxsd_enclave_get_next_report(sgx_target_info_t qe_target_info, sgx_report_t *p_report);
 sgx_status_t sgxsd_enclave_set_current_quote();
 sgx_status_t sgxsd_enclave_negotiate_request(const sgxsd_request_negotiation_request_t *p_request, sgxsd_request_negotiation_response_t *p_response);
 sgx_status_t sgxsd_enclave_server_start(const sgxsd_server_init_args_t* p_args, sgxsd_server_state_handle_t state_handle);
@@ -45,7 +48,6 @@ sgx_status_t sgxsd_enclave_server_stop(const sgxsd_server_terminate_args_t* p_ar
 extern void *g_sgxsd_enclave_pending_requests;
 
 sgx_status_t sgxsd_ocall_reply(sgx_status_t* retval, const sgxsd_msg_header_t* reply_header, const uint8_t* reply_data, size_t reply_data_size, sgxsd_msg_tag_t msg_tag);
-sgx_status_t sgxsd_ocall_ra_get_quote(sgx_status_t* retval, sgx_report_t report, sgx_quote_nonce_t nonce, const void* vp_get_quote_args, sgx_report_t* p_qe_report, sgx_quote_t* p_quote, uint32_t quote_size);
 
 void test_read_rand(void *dst, size_t size);
 void expect_sgx_read_rand(sgx_status_t res, unsigned char **p_rand, size_t expected_length_in_bytes);
@@ -84,8 +86,7 @@ sgxsd_node_init_args_t *test_node_init_args;
 
 sgxsd_request_negotiation_request_t *p_test_request_negotiation_request;
 sgx_target_info_t test_qe_target_info;
-sgx_quote_t *p_test_quote;
-uint32_t test_quote_size;
+sgx_report_t *p_test_report;
 
 sgxsd_server_state_handle_t valid_server_handle = 0;
 sgxsd_server_state_handle_t invalid_server_handle = UINT64_MAX;
@@ -95,6 +96,7 @@ sgxsd_msg_buf_t test_msg_buf;
 
 sgxsd_msg_header_t test_msg_header;
 
+sgxsd_msg_buf_t null_msg_buf  = { .data = NULL, .size = 0 };
 sgxsd_msg_buf_t empty_msg_buf = { .data = NULL, .size = 0 };
 sgxsd_msg_from_t valid_msg_from;
 
@@ -106,6 +108,8 @@ static void setup_tests(void **state) {
   *test_node_init_args = (sgxsd_node_init_args_t) {
     .pending_requests_table_order = 0,
   };
+
+  empty_msg_buf.data = malloc(0);
 
   long int test_args_size_rand;
   lrand48_r(&test_drand48_data, &test_args_size_rand);
@@ -124,9 +128,8 @@ static void setup_tests(void **state) {
   p_test_request_negotiation_request = test_malloc(sizeof(*p_test_request_negotiation_request));
   test_read_rand(p_test_request_negotiation_request, sizeof(*p_test_request_negotiation_request));
   test_read_rand(&test_qe_target_info, sizeof(test_qe_target_info));
-  test_quote_size = sizeof(*p_test_quote);
-  p_test_quote = test_malloc(test_quote_size);
-  test_read_rand(p_test_quote, test_quote_size);
+  p_test_report = test_malloc(sizeof(*p_test_report));
+  test_read_rand(p_test_report, sizeof(*p_test_report));
 
   test_read_rand(&test_msg_header.iv, sizeof(test_msg_header.iv));
   test_read_rand(&test_msg_header.mac, sizeof(test_msg_header.mac));
@@ -137,8 +140,9 @@ static void teardown_tests(void **state) {
   test_free(test_node_init_args);
   test_free(test_args);
   test_free(test_msg_buf.data);
+  test_free(empty_msg_buf.data);
   test_free(p_test_request_negotiation_request);
-  test_free(p_test_quote);
+  test_free(p_test_report);
 }
 
 static void teardown_node_tests(void **state) {
@@ -193,24 +197,16 @@ static void test_sgxsd_node_init_already_initialized(void **state) {
 }
 
 //
-// get_next_quote tests
+// get_next_report tests
 //
 
-static void test_sgxsd_get_next_quote_node_uninitialized(void **state) {
-  assert_int_equal(SGX_ERROR_INVALID_STATE, sgxsd_enclave_get_next_quote
-                   (test_qe_target_info, NULL, p_test_quote, test_quote_size));
+static void test_sgxsd_get_next_report_node_uninitialized(void **state) {
+  assert_int_equal(SGX_ERROR_INVALID_STATE, sgxsd_enclave_get_next_report
+                   (test_qe_target_info, p_test_report));
 }
-static void test_sgxsd_get_next_quote_null_quote(void **state) {
-  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_get_next_quote
-                   (test_qe_target_info, NULL, NULL, test_quote_size));
-}
-static void test_sgxsd_get_next_quote_empty_quote(void **state) {
-  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_get_next_quote
-                   (test_qe_target_info, NULL, NULL, 0));
-}
-static void test_sgxsd_get_next_quote_too_small_quote(void **state) {
-  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_get_next_quote
-                   (test_qe_target_info, NULL, p_test_quote, 1));
+static void test_sgxsd_get_next_report_null_report(void **state) {
+  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_get_next_report
+                   (test_qe_target_info, NULL));
 }
 
 //
@@ -307,12 +303,6 @@ static void test_sgxsd_server_call_not_started(void **state) {
                    (test_args, &test_msg_header, test_msg_buf.data, test_msg_buf.size, valid_msg_from.tag,
                     valid_server_handle));
 }
-static void test_sgxsd_server_call_empty(void **state) {
-  test_sgxsd_negotiate_request(&test_msg_header.pending_request_id);
-  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_server_call
-                   (test_args, &test_msg_header, NULL, 0, valid_msg_from.tag,
-                    valid_server_handle));
-}
 static void test_sgxsd_server_call(sgx_status_t res, sgx_status_t decrypt_msg_res,
                                    sgx_status_t handle_call_res, sgxsd_msg_buf_t msg) {
   test_sgxsd_negotiate_request(&test_msg_header.pending_request_id);
@@ -335,6 +325,19 @@ static void test_sgxsd_server_call_decrypt_msg_error(void **state) {
 }
 static void test_sgxsd_server_call_handler_error(void **state) {
   test_sgxsd_server_call(SGX_ERROR_UNEXPECTED, SGX_SUCCESS, SGX_ERROR_UNEXPECTED, test_msg_buf);
+}
+static void test_sgxsd_server_call_empty(void **state) {
+  test_sgxsd_negotiate_request(&test_msg_header.pending_request_id);
+  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_server_call
+                   (test_args, &test_msg_header, NULL, 0, valid_msg_from.tag,
+                    valid_server_handle));
+}
+static void test_sgxsd_server_call_invalid_null_data(void **state) {
+  // SGX Edger8r-generated interfaces pass through NULL data pointers along with non-zero data size
+  test_sgxsd_negotiate_request(&test_msg_header.pending_request_id);
+  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_server_call
+                   (test_args, &test_msg_header, NULL, 1, valid_msg_from.tag,
+                    valid_server_handle));
 }
 static void test_sgxsd_server_call_valid(void **state) {
   test_sgxsd_server_call(SGX_SUCCESS, SGX_SUCCESS, SGX_SUCCESS, test_msg_buf);
@@ -407,7 +410,8 @@ static void test_sgxsd_server_reply_ocall_error(void **state) {
   test_sgxsd_server_reply(SGX_ERROR_UNEXPECTED, SGX_SUCCESS, SGX_SUCCESS, SGX_ERROR_UNEXPECTED, test_msg_buf);
 }
 static void test_sgxsd_server_reply_empty(void **state) {
-  assert_int_equal(SGX_ERROR_INVALID_PARAMETER, sgxsd_enclave_server_reply(empty_msg_buf, valid_msg_from));
+  test_sgxsd_server_reply(SGX_SUCCESS, SGX_SUCCESS, SGX_SUCCESS, SGX_SUCCESS, null_msg_buf);
+  test_sgxsd_server_reply(SGX_SUCCESS, SGX_SUCCESS, SGX_SUCCESS, SGX_SUCCESS, empty_msg_buf);
 }
 static void test_sgxsd_server_reply_valid(void **state) {
   test_sgxsd_server_reply(SGX_SUCCESS, SGX_SUCCESS, SGX_SUCCESS, SGX_SUCCESS, test_msg_buf);
@@ -418,7 +422,7 @@ int main(int argc, char *argv[]) {
     unit_test_setup(tests, setup_tests),
 
     // uninitialized node tests
-    unit_test(test_sgxsd_get_next_quote_node_uninitialized),
+    unit_test(test_sgxsd_get_next_report_node_uninitialized),
     unit_test(test_sgxsd_set_current_quote_node_uninitialized),
     unit_test(test_sgxsd_negotiate_request_node_uninitialized),
     unit_test(test_sgxsd_server_start_node_uninitialized),
@@ -432,10 +436,8 @@ int main(int argc, char *argv[]) {
     unit_test_setup(node_tests, test_sgxsd_node_init),
     unit_test(test_sgxsd_node_init_already_initialized),
 
-    // get_next_quote tests
-    unit_test(test_sgxsd_get_next_quote_null_quote),
-    unit_test(test_sgxsd_get_next_quote_empty_quote),
-    unit_test(test_sgxsd_get_next_quote_too_small_quote),
+    // get_next_report tests
+    unit_test(test_sgxsd_get_next_report_null_report),
 
     // negotiate_request tests
     unit_test(test_sgxsd_negotiate_request_null_request),
@@ -453,6 +455,7 @@ int main(int argc, char *argv[]) {
     unit_test_setup_teardown(test_sgxsd_server_call_invalid_handle, test_sgxsd_server_start_valid, test_sgxsd_server_stop_valid),
     unit_test(test_sgxsd_server_call_not_started),
     unit_test_setup_teardown(test_sgxsd_server_call_empty, test_sgxsd_server_start_valid, test_sgxsd_server_stop_valid),
+    unit_test_setup_teardown(test_sgxsd_server_call_invalid_null_data, test_sgxsd_server_start_valid, test_sgxsd_server_stop_valid),
     unit_test_setup_teardown(test_sgxsd_server_call_decrypt_msg_error, test_sgxsd_server_start_valid, test_sgxsd_server_stop_valid),
     unit_test_setup_teardown(test_sgxsd_server_call_handler_error, test_sgxsd_server_start_valid, test_sgxsd_server_stop_valid),
     unit_test_setup_teardown(test_sgxsd_server_call_valid, test_sgxsd_server_start_valid, test_sgxsd_server_stop_valid),
@@ -557,27 +560,21 @@ void expect_sgxsd_aes_gcm_encrypt(sgx_status_t res,
     expect_not_value(sgxsd_aes_gcm_encrypt, p_src, NULL);
   } else {
     will_return(sgxsd_aes_gcm_encrypt, NULL);
-    if (expected_p_src != NULL) {
-      assert_int_not_equal(expected_src_len, 0);
+    if (expected_src_len != 0) {
+      assert_int_not_equal(expected_p_src, NULL);
       expect_memory(sgxsd_aes_gcm_encrypt, p_src, expected_p_src, expected_src_len);
     } else {
-      assert_int_equal(expected_src_len, 0);
-      // sgx requires src_len + aad_len > 0
-      if (expected_aad_len == 0) {
-        assert_int_equal(res, SGX_ERROR_INVALID_PARAMETER);
-      }
-      expect_value(sgxsd_aes_gcm_encrypt, p_src, NULL);
+      expect_any(sgxsd_aes_gcm_encrypt, p_src);
     }
   }
   will_return(sgxsd_aes_gcm_encrypt, res_p_dst);
   expect_memory(sgxsd_aes_gcm_encrypt, p_iv, expected_p_iv, sizeof(expected_p_iv->data));
   expect_value(sgxsd_aes_gcm_encrypt, aad_len, expected_aad_len);
-  if (expected_p_aad != NULL) {
-    assert_int_not_equal(expected_aad_len, 0);
+  if (expected_aad_len != 0) {
+    assert_int_not_equal(expected_p_aad, NULL);
     expect_memory(sgxsd_aes_gcm_encrypt, p_aad, expected_p_aad, expected_aad_len);
   } else {
-    assert_int_equal(expected_aad_len, 0);
-    expect_value(sgxsd_aes_gcm_encrypt, p_aad, NULL);
+    expect_any(sgxsd_aes_gcm_encrypt, p_aad);
   }
   will_return(sgxsd_aes_gcm_encrypt, res_out_mac);
   will_return(sgxsd_aes_gcm_encrypt, res);
@@ -598,8 +595,7 @@ sgx_status_t sgxsd_aes_gcm_encrypt(const sgxsd_aes_gcm_key_t *p_key,
   const void *res_p_dst = (const void *) mock();
   if (res_p_dst != NULL) {
     assert_int_not_equal(p_dst, NULL);
-    // sgx_tcrypto doesnt specify whether src and dst buffers can overlap
-    assert_int_not_equal(p_src, p_dst);
+    assert_int_not_equal(p_src, NULL);
     memcpy(p_dst, res_p_dst, src_len);
     test_free(res_p_dst);
   }
@@ -638,26 +634,20 @@ void expect_sgxsd_aes_gcm_decrypt(sgx_status_t res,
     expect_not_value(sgxsd_aes_gcm_decrypt, p_key, NULL);
   }
   expect_value(sgxsd_aes_gcm_decrypt, src_len, expected_src_len);
-  if (expected_p_src != NULL) {
-    assert_int_not_equal(expected_src_len, 0);
+  if (expected_src_len != NULL) {
+    assert_int_not_equal(expected_p_src, NULL);
     expect_memory(sgxsd_aes_gcm_decrypt, p_src, expected_p_src, expected_src_len);
   } else {
-    assert_int_equal(expected_src_len, 0);
-    // sgx requires src_len + aad_len > 0
-    if (expected_aad_len == 0) {
-      assert_int_equal(res, SGX_ERROR_INVALID_PARAMETER);
-    }
-    expect_value(sgxsd_aes_gcm_decrypt, p_src, NULL);
+    expect_any(sgxsd_aes_gcm_decrypt, p_src);
   }
   will_return(sgxsd_aes_gcm_decrypt, res_p_dst);
   expect_memory(sgxsd_aes_gcm_decrypt, p_iv, expected_p_iv, sizeof(expected_p_iv->data));
   expect_value(sgxsd_aes_gcm_decrypt, aad_len, expected_aad_len);
-  if (expected_p_aad != NULL) {
-    assert_int_not_equal(expected_aad_len, 0);
+  if (expected_aad_len != NULL) {
+    assert_int_not_equal(expected_p_aad, NULL);
     expect_memory(sgxsd_aes_gcm_decrypt, p_aad, expected_p_aad, expected_aad_len);
   } else {
-    assert_int_equal(expected_aad_len, 0);
-    expect_value(sgxsd_aes_gcm_decrypt, p_aad, NULL);
+    expect_any(sgxsd_aes_gcm_decrypt, p_aad);
   }
   expect_memory(sgxsd_aes_gcm_decrypt, p_in_mac, expected_p_in_mac, sizeof(expected_p_in_mac->data));
   will_return(sgxsd_aes_gcm_decrypt, res);
@@ -673,8 +663,7 @@ sgx_status_t sgxsd_aes_gcm_decrypt(const sgxsd_aes_gcm_key_t *p_key,
   const void *res_p_dst = (const void *) mock();
   if (res_p_dst != NULL) {
     assert_int_not_equal(p_dst, NULL);
-    // sgx_tcrypto doesnt specify whether src and dst buffers can overlap
-    assert_int_not_equal(p_src, p_dst);
+    assert_int_not_equal(p_src, NULL);
     memcpy(p_dst, res_p_dst, src_len);
     test_free(res_p_dst);
   }
@@ -692,12 +681,11 @@ void expect_sgxsd_ocall_reply(sgx_status_t ocall_res, sgx_status_t res,
                               const sgxsd_aes_gcm_mac_t *p_expected_out_mac,
                               uint64_t expected_tag) {
   expect_value(sgxsd_ocall_reply, reply_data_size, expected_reply_data_size);
-  if (p_expected_dst != NULL) {
-    assert_int_not_equal(expected_reply_data_size, 0);
+  if (expected_reply_data_size != 0) {
+    assert_int_not_equal(p_expected_dst, NULL);
     expect_memory(sgxsd_ocall_reply, reply_data, p_expected_dst, expected_reply_data_size);
   } else {
-    assert_int_equal(expected_reply_data_size, 0);
-    expect_value(sgxsd_ocall_reply, reply_data, NULL);
+    expect_any(sgxsd_ocall_reply, reply_data);
   }
   expect_memory(sgxsd_ocall_reply, reply_header->iv.data, expected_iv, expected_iv_len);
   expect_memory(sgxsd_ocall_reply, reply_header->mac.data, p_expected_out_mac, sizeof(p_expected_out_mac->data));
@@ -736,16 +724,13 @@ uint32_t sgx_spin_unlock(sgx_spinlock_t *lock) {
   return 0;
 }
 
-sgx_status_t sgx_sha256_init(sgx_sha_state_handle_t* p_sha_handle) {
-  return (sgx_status_t) SGX_SUCCESS;
+void br_sha256_init(br_sha256_context *sha_context) {
 }
 
-sgx_status_t sgx_sha256_update(const uint8_t *p_src, uint32_t src_len, sgx_sha_state_handle_t sha_handle) {
-  return (sgx_status_t) SGX_SUCCESS;
+void br_sha256_update(br_sha256_context *sha_context, const void *p_src, size_t src_len) {
 }
 
-sgx_status_t sgx_sha256_get_hash(sgx_sha_state_handle_t sha_handle, sgx_sha256_hash_t *p_hash) {
-  return (sgx_status_t) SGX_SUCCESS;
+void br_sha256_out(const br_sha256_context *sha_handle, void *p_hash) {
 }
 
 sgx_status_t sgx_sha256_close(sgx_sha_state_handle_t sha_handle) {
@@ -775,12 +760,11 @@ void expect_sgxsd_enclave_server_handle_call(sgx_status_t res, void *expected_ar
                                              sgxsd_msg_buf_t expected_msg, sgxsd_msg_from_t expected_from) {
   expect_memory(sgxsd_enclave_server_handle_call, args, expected_args, expected_args_size);
   expect_value(sgxsd_enclave_server_handle_call, msg.size, expected_msg.size);
-  if (expected_msg.data != NULL) {
-    assert_int_not_equal(expected_msg.size, 0);
+  if (expected_msg.size != 0) {
+    assert_int_not_equal(expected_msg.data, NULL);
     expect_memory(sgxsd_enclave_server_handle_call, msg.data, expected_msg.data, expected_msg.size);
   } else {
-    assert_int_equal(expected_msg.size, 0);
-    expect_value(sgxsd_enclave_server_handle_call, msg.data, NULL);
+    expect_any(sgxsd_enclave_server_handle_call, msg.data);
   }
   expect_memory(sgxsd_enclave_server_handle_call, &from.tag, &expected_from.tag, sizeof(expected_from.tag));
   expect_not_value(sgxsd_enclave_server_handle_call, vpp_state, NULL);
